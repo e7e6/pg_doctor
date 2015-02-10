@@ -1,0 +1,866 @@
+#!/usr/bin/perl
+
+##############################################
+# pg_doctor version 0.1
+# "omg such ugly code" first version
+# Tested on ubuntu 14.04,fedora 21
+# Should be launched as postgres user
+# 
+# 
+##############################################
+
+use strict;
+use warnings;
+# use Time::Piece;
+
+##############################################
+# Global user variables
+
+my $CPU_HIGH_USAGE = 50;
+my $TABLE_BLOAT = 2;
+my $TABLE_WASTED_BYTES = 100;
+my $PCT_MAX_CONNECTIONS = 90;
+my $MIN_CONNECTIONS_LEFT = 10;
+my $PARTITION_MIN_SPACE = 50;
+my $MAX_NB_LOCKS_PER_DATABASE = 500;
+
+#FIXME : use the alias
+my $psql_command = "psql --no-psqlrc";
+
+##############################################
+
+# Color for the output
+my $good = "[\e[0;32mOK\e[0m]" ;
+my $bad  = "[\e[0;31mKO\e[0m]" ;
+my $info = "[\e[0;34m--\e[0m]" ;
+
+# Getting some postgresql global variables
+my $postgresql_conf_sql = "select setting from pg_settings where name = 'data_directory'";
+my @postgresql_conf_result = `psql -t -c "$postgresql_conf_sql" postgres`;
+my $DATA_DIRECTORY = $postgresql_conf_result[0];
+
+my $arg0 = $ARGV[0];
+
+if (not defined $arg0)                  {&bad_arguments}
+elsif ($arg0 eq "--help")               {&bad_arguments}
+elsif ($arg0 eq "health")               {&health}
+else                                    {&bad_arguments}
+
+# #--------------------------------------------------------------------------------
+sub bad_arguments {
+    print "Utilisation: pg_doctor [OPTION] [DATABASE]
+           ...
+           [OPTION]:
+             health               : analyse l'état du serveur\n"
+}
+
+# #--------------------------------------------------------------------------------
+# Connected users
+
+sub sessions {
+
+    my $sql = "
+        select *
+        from
+	(( select datname,
+                count(*)
+ 	  from pg_stat_activity
+	  group by datname order by 1)
+	UNION
+	( select '_TOTAL_',
+	  count(*)
+	  from pg_stat_activity)) as listingsessions
+	order by datname";
+
+    system("psql -c \"$sql\" dummydb");
+}
+# #--------------------------------------------------------------------------------
+# Find cluster's uptime
+
+sub uptime{
+
+    my $sql = "select date_trunc('second',current_timestamp - pg_postmaster_start_time()) as uptime;";
+   system("psql -c \"$sql\" dummydb");
+
+}
+# #--------------------------------------------------------------------------------
+# Running queries
+
+sub queries{
+    my $sql = "select current_timestamp - query_start as runtime,
+                      pid,datname,usename,query
+               from pg_stat_activity
+               where query != '<IDLE>'
+               order by 1 desc";
+   system("psql -c \"$sql\" postgres");
+}
+# #--------------------------------------------------------------------------------
+# List server non-default settings
+
+sub non_default_settings {
+    my $sql = "select name, source, setting
+               from pg_settings
+               where source != 'default' and source != 'override' order by 1,2";
+    system("psql -c \"$sql\" postgres");
+}
+# #--------------------------------------------------------------------------------
+# Kill sessions, either for a database or a pid
+
+sub kill_proc {
+
+    my $arg1 = $ARGV[1];
+    if (not defined $arg1)      {&bad_arguments}
+    my $sql="";
+
+    # digit was entered, we try to kill the aforementionned pid
+    if ($arg1 =~ m/(\d+)/ ) {
+	$sql = "select count(pg_terminate_backend(pid)) as nb_killed_proc
+                from pg_stat_activity
+                where pid = $arg1";
+    }
+    else {
+	$sql = "select count(pg_terminate_backend(pid)) as nb_killed_proc
+	        from pg_stat_activity
+                where datname = '$arg1'";
+    }
+    system("psql -c \"$sql\" postgres");
+    
+}
+
+# #--------------------------------------------------------------------------------
+# Kill idle in transactions queries (>5m)
+
+sub kill_idle_proc {
+
+    my $sql="select count(pg_terminate_backend(pid)) as nb_killed_proc
+                from pg_stat_activity
+                where query = '<IDLE> in transaction' and
+                      current_timestamp - query_start > '5 min'";
+    system("psql -c \"$sql\" postgres");
+    
+}
+
+# #--------------------------------------------------------------------------------
+# Cancel sessions, either for a database or a pid
+
+sub cancel_proc {
+
+    my $arg1 = $ARGV[1];
+    if (not defined $arg1)      {&bad_arguments}
+    my $sql="";
+
+    # digit was entered, we try to kill the aforementionned pid
+    if ($arg1 =~ m/(\d+)/ ) {
+	$sql = "select count(pg_cancel_backend(pid)) as nb_cancelled_proc
+                from pg_stat_activity
+                where pid = $arg1";
+    }
+    else {
+	$sql = "select count(pg_cancel_backend(pid)) as nb_cancelled_proc
+	        from pg_stat_activity
+                where datname = '$arg1'";
+    }
+    system("psql -c \"$sql\" postgres");
+    
+}
+
+
+
+
+# #--------------------------------------------------------------------------------
+# BOF
+sub sauve_base {
+    
+    my $arg1 = $ARGV[1];
+    my $backup_name = "";
+    if (not defined $arg1)      {&bad_arguments}
+    else {
+	my $arg2 = $ARGV[2];
+	if (not defined $arg2) {
+	    $backup_name = "/tmp/" . $arg1 . "_" . localtime->strftime('%Y%m%d' . ".dmp");
+	}
+	else {
+	    $backup_name = $arg2;
+	}
+
+	print "Database $arg1: starting backup...\n";
+	my $res = `pg_dump $arg1 -Fc -f $backup_name`;
+
+	if ($? != 0) {
+	    print "Unable to backup database $arg1 !\n";
+	}
+	else {
+	    print "Backup OK: $backup_name\n";
+	}
+    }
+}
+
+# #--------------------------------------------------------------------------------
+# Main routine to check server's health
+
+sub health {
+    &health_system_config;
+    &health_cluster_config;
+    &health_databases;
+    &health_tables;
+    &health_queries;
+    &health_index;
+}
+
+# #--------------------------------------------------------------------------------
+# Checking general system health: CPU, memory, system configuration files
+
+sub health_system_config {
+    print "\n- System ----------------------------------------\n";
+
+   ##--------------------------------------------------
+   # Check CPU Usage
+   # CORRECT ME - top command is not correct
+   my $cpu_top = `top -bn1 | grep "Cpu(s)" `;
+   my $cpu = 0;
+   # if ($cpu_top =~ m/Cpu\(s\):(.*?),/) {
+   if ($cpu_top =~ m/Cpu\(s\):\s*([0-9]+)/) {
+       if ($1 < $CPU_HIGH_USAGE) { 
+	   print "$good CPU Usage is normal ($1 %)\n";
+       }
+       else {
+	   print "$bad High CPU Usage ($1 %)\n";
+       }  
+   }
+    else {
+	print "did not recognise cpu\n";
+    }
+      
+   ##--------------------------------------------------
+   # Check load
+
+   my $cpu_load = `cat /proc/loadavg`;
+   my $proc_nb  = `nproc`;
+
+   if ($cpu_load =~ m/(\d+.\d+)\s*(\d+.\d+)\s*(\d+.\d+)/) { # Cpu\(s\):(.*?),/)
+       if ((($1 / $proc_nb) > 1) or (($2 / $proc_nb) > 1) or (($3 / $proc_nb) > 1)) {
+	   print "\t$bad High CPU Load ($1 $2 $3) \n";
+       }
+       else {
+	   print "$good CPU Load is normal ($1 $2 $3)\n";
+       }
+    
+   ##--------------------------------------------------
+   # Check Memory Usage
+   
+   ##--------------------------------------------------
+   # Disk free space
+   
+   # a rather stupid way to get rid of df: «/run/user/1000/gvfs kind of errors
+   my @disk_space = `df 2>/dev/null`;
+   my $low_space_list   = "";
+        
+    foreach my $d (@disk_space) {
+    	if ($d =~ m/(\d+)\%\s\/(\w+)/) {
+	    #print "partition=$1 freespace=$1\n";
+	    if ($1 > $PARTITION_MIN_SPACE) {
+		$low_space_list .=  "$2= $1% ";
+	    }
+	}
+    }
+
+    if ($low_space_list eq "") {
+	print "$good Enough space on all partitions\n";
+    }
+    else {
+	print "$bad Not enough space on partitions: $low_space_list\n";
+    }
+
+   #--------------------------------------------------
+   # System settings found in /etc/sysctl.conf
+   #kernel.shmmax = 13421772800
+   #kernel.shmall = 20971520
+   
+   my $swappiness =  `cat /proc/sys/vm/swappiness`;
+   my $sysctlconf_bad_results = "";
+       
+   chomp($swappiness);
+   if ($swappiness > 10) {
+       #print "\t[NOK] vm.swappiness: $swappiness. Should be 0 < sw < 10.\n";
+       $sysctlconf_bad_results .= "     vm.swappiness: $swappiness. Should be 0 < sw < 10\n";
+   }
+   else {
+       #print "\t[OK]  vm.swappiness\n";
+   }
+
+   my $dirty_ratio =  `cat /proc/sys/vm/dirty_ratio`;
+   chomp($dirty_ratio);
+   if ($dirty_ratio != 2) {
+#       print "\t[NOK] dirty_ratio: $dirty_ratio. Should be dr = 2.\n";
+       $sysctlconf_bad_results .= "     dirty_ratio: $dirty_ratio. Should be dr = 2\n";
+   }
+   else {
+#       print "\t[OK]  dirty_ratio\n";
+   }
+
+   my $overcommit_memory =  `cat /proc/sys/vm/overcommit_memory`;
+   chomp($overcommit_memory);
+   if ($overcommit_memory != 2) {
+       #print "\t[NOK] overcommit_memory: $overcommit_memory. Should be om = 2.\n";
+       $sysctlconf_bad_results .= "     overcommit_memory: $overcommit_memory. Should be om = 2 on a dedicated box.\n";       
+   }
+   else {
+#      print "\t[OK]  overcommit_memory\n";
+   }
+
+   my $overcommit_ratio =  `cat /proc/sys/vm/overcommit_ratio`;
+   chomp($overcommit_ratio);
+   if ($overcommit_ratio != 80) {
+  #     print "\t[NOK] overcommit_ratio: $overcommit_ratio. Should be or = 80.\n";
+       $sysctlconf_bad_results .= "     overcommit_ratio: $overcommit_ratio. Should be or = 80.\n";       
+   }
+   else {
+#       print "\t[OK]  overcommit_ratio\n";
+   }
+
+   my $zone_reclaim_mode =  `cat /proc/sys/vm/zone_reclaim_mode`;
+   chomp($zone_reclaim_mode);
+   if ($zone_reclaim_mode != 0) {
+ #      print "\t[NOK] zone_reclaim_mode: $zone_reclaim_mode. Should be zrm = 0.\n";
+       $sysctlconf_bad_results .= "     zone_reclaim_mode: $zone_reclaim_mode. Should be zrm = 0\n";              
+   }
+   else {
+#       print "\t[OK]  zone_reclaim_mode\n";
+   }
+
+   my $dirty_background_ratio =  `cat /proc/sys/vm/dirty_background_ratio`;
+   chomp($dirty_background_ratio);
+   if ($dirty_background_ratio != 1) {
+#       print "\t[NOK] dirty_background_ratio: $dirty_background_ratio. Should be dbr = 1.\n";
+       $sysctlconf_bad_results .= "     dirty_background_ratio: $dirty_background_ratio. Should be dbr = 1\n";       
+   }
+   else {
+#       print "\t[OK]  dirty_background_ratio\n";
+   }
+
+   if ($sysctlconf_bad_results ne "") {
+       print "$bad kernel settings :\n$sysctlconf_bad_results";
+   }
+   else {
+       print "$good kernel configuration correct.\n"
+   }
+	  
+
+       
+   #--------------------------------------------------
+   # Check no atime config
+   # FIXME: Very dummy check so far
+   # Should be improved to see if $data_directory is really a noatime partition
+
+    my $filename_fstab = "/etc/fstab";
+    open (my $fh, '<:encoding(UTF-8)', $filename_fstab)
+	 or die "Could not open $filename_fstab !";
+#
+#    my $work_mem = "";
+    my $noatime = "";
+#    
+    while (my $line = <$fh>) {
+      if (($line =~ m/noatime/) and ($line !~ m/\s*#/)) { 
+          $noatime .= "Noatime found for a partition";
+          #print "boot found with option !\n";
+        #if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
+        #  $work_mem = $1;
+        #  print "found it!!";
+        }
+        else {
+          # print "not found\n"
+        }
+    }
+
+    
+    if ($noatime eq '') {
+      print "$bad Consider using noatime for the database partition\n"; 
+    }
+    else {
+      print "$good $noatime - check your /etc/fstab\n";
+    }
+
+
+   #--------------------------------------------------
+   # Check dedicated partition for data files and wal
+   
+
+   }
+
+   
+}
+# #--------------------------------------------------------------------------------
+sub health_cluster_config {
+    print "\n- Cluster configuration -------------------------\n";
+
+   #--------------------------------------------------
+   # Rights and privileges
+   # check postgresql.conf 
+
+#    my $filename_postgresql_conf = "/etc/postgresql/9.3/main/postgresql.conf";
+#    open (my $fh, '<:encoding(UTF-8)', $filename_postgresql_conf)
+#	or die "Could not open $filename_postgresql_conf !";
+#
+#    my $work_mem = "";
+#    my $effective_cache_size = "";
+#    
+#    while (my $line = <$fh>) {
+##	if ($line =~ m/work_mem(\w+)(\d+)/) { #(\w+)(\d+)/) {
+#    	if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
+#	    $work_mem = $1;
+#	    print "found it!!";
+#	}
+#	
+#    }
+#    print "------------> workmem =$work_mem.\n";
+#    # work_mem
+
+   #--------------------------------------------------
+   # Check "weird" settings in postgresql.conf 
+   # FIXME
+   # autovacuum disabled / ...
+   # see if (work_mem) * max_connections + maintenance_workers * maintenance_mem close too close to RAM	
+   # work_mem : around 8MB RAM below 32GB 16MB RAM below 64GB
+   # look at maintenance_work_mem around 1GB ?
+   # archive_mode = on ?
+   # max_wal_senders = around 5 ?
+   # effective_cache_size 
+   # max_connections?
+   # shared_buffers ?
+
+
+   #--------------------------------------------------
+   # 
+   #--------------------------------------------------
+   # Connections
+
+   my $sql = "with maxconn(max) as (select setting as MAX from pg_settings where name = 'max_connections')
+, nbconn(nb) as (select count(*) as NB from pg_stat_activity )
+select ((NB::float / MAX::float) * 100.0)::int as pct_connection, MAX::int - NB::int as left_connections, NB as nb_connections, MAX as max_connections
+from maxconn,nbconn";
+
+    my @result = `psql -c "$sql" postgres`;
+    my $low_nb = 0;
+
+    my $pct_connection   = 0;
+    my $left_connections = 0;
+    my $nb_connections   = 0;
+    my $max_connections  = 0;
+    
+    foreach my $d (@result) {
+#	if ($d =~ m/(\d+)\s*+(\d+)\s+(\d+)\s+(\d+)/) {
+    	if ($d =~ m/(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)/) {
+
+	    $pct_connection   = $1;
+	    $left_connections = $2;
+	    $nb_connections   = $3;
+	    $max_connections  = $4;
+	    if (($pct_connection > $PCT_MAX_CONNECTIONS) or ($left_connections < $MIN_CONNECTIONS_LEFT)) {
+		$low_nb = 1;
+	    }
+	}
+    }
+
+    $sql = "select datname,count(*) from pg_stat_activity
+	  group by datname order by datname";
+    my $connections_listing = "";
+    @result =  `psql -c "$sql" postgres`;
+
+    foreach my $db (@result) {
+	if ($db =~ m/(\w+)\s*\|\s*(\d+)/) {
+	    $connections_listing .= "     $1: $2 session(s)\n";
+	}
+    }
+    
+    if ($low_nb == 0) {
+	print "$good Connected sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing"; 
+    }
+    else {
+	print "$bad High number of sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing";
+    }
+
+
+}
+# #--------------------------------------------------------------------------------
+sub health_databases {
+    print "\n- Databases -------------------------------------\n";
+
+    #--------------------------------------------------
+    # Buffer cache hit ratio 
+    my $sql = "select datname, blks_hit::float/(blks_hit+blks_read) as hit_ratio from pg_stat_database where blks_read+blks_hit <> 0";
+    my @result = `psql -c "$sql" postgres`;
+    my $bad_bchr_db = "";
+    my $good_bchr_db = "";
+    my $bchr = 0;
+
+    foreach my $d (@result) {
+	if ($d =~ m/([0-9]+.[0-9]+)/) {
+	    $bchr = int(10000 * $1);
+	    if ($bchr < 9995) {
+		if ($d =~ m/(\w+)/) {
+		    $bad_bchr_db .= "$1= " . $bchr/100 . "% "
+		} 
+	    }
+	    else {
+		if ($d =~ m/(\w+)/) {
+		    $good_bchr_db .= "$1= " . $bchr/100 . "% "
+		}
+	    }
+	}
+    }
+    
+    if ($good_bchr_db ne "") {
+	print "$good Good buffer cache hit ratio for:\n     $good_bchr_db\n";
+    }
+    elsif ($bad_bchr_db ne "") {
+	print "$bad Bad buffer cache hit ratio for:\n     $bad_bchr_db\n";
+    }
+    else {
+	print "$info Not enough data to calculate buffer cache hit ratio\n"
+    }
+
+    #--------------------------------------------------
+    # Number of locks per database
+    # FIX ME
+    $sql = "select d.datname, count(*) from pg_database d left join pg_locks l on d.oid = l.database group by d.datname;";
+    my @nb_locks_list = `psql -t -c "$sql" postgres`;
+    my $database_locks_ok = "";
+    my $database_locks_ko = "";
+    foreach my $r (@nb_locks_list) {
+      #if ($r =~ m/(\w+)(\s*)|(\s*)[0-9]+/) {
+      if ($r =~ m/(\w+)\s*\|\s*(\d+)/) {
+        # print "BD=$1 LOCKS=$2\n";
+        if ($2 > $MAX_NB_LOCKS_PER_DATABASE) { 
+          $database_locks_ko .=  "$1 ";
+        }
+        else {
+          $database_locks_ok .=  "$1 ";
+        }
+      }
+    }
+    
+    if ($database_locks_ok ne "") {
+      print "$good Database number of locks < $MAX_NB_LOCKS_PER_DATABASE for $database_locks_ok\n";
+    }
+    elsif ($database_locks_ko ne "") {
+      print "$bad Database number of locks > $MAX_NB_LOCKS_PER_DATABASE for $database_locks_ko\n";
+    }
+ 
+
+}
+
+# #--------------------------------------------------------------------------------
+sub health_tables {
+    print "\n- Tables ------------------------------------------\n";
+
+    #--------------------------------------------------
+    # Check table bloat
+    # see wiki.postgresql.org/wiki/Show_database_bloat
+    
+    
+    my $sql = " SELECT tablename, 
+  ROUND(CASE WHEN otta=0 THEN 0.0 ELSE sml.relpages/otta::numeric END,1) AS tbloat,
+  CASE WHEN relpages < otta THEN 0 ELSE bs*(sml.relpages-otta)::bigint END AS wastedbytes
+  FROM (
+  SELECT
+    schemaname, tablename, cc.reltuples, cc.relpages, bs,
+    CEIL((cc.reltuples*((datahdr+ma-
+      (CASE WHEN datahdr%ma=0 THEN ma ELSE datahdr%ma END))+nullhdr2+4))/(bs-20::float)) AS otta,
+    COALESCE(c2.relname,'?') AS iname, COALESCE(c2.reltuples,0) AS ituples, COALESCE(c2.relpages,0) AS ipages,
+    COALESCE(CEIL((c2.reltuples*(datahdr-12))/(bs-20::float)),0) AS iotta -- very rough approximation, assumes all cols
+  FROM (
+    SELECT
+      ma,bs,schemaname,tablename,
+      (datawidth+(hdr+ma-(case when hdr%ma=0 THEN ma ELSE hdr%ma END)))::numeric AS datahdr,
+      (maxfracsum*(nullhdr+ma-(case when nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
+    FROM (
+      SELECT
+        schemaname, tablename, hdr, ma, bs,
+        SUM((1-null_frac)*avg_width) AS datawidth,
+        MAX(null_frac) AS maxfracsum,
+        hdr+(
+          SELECT 1+count(*)/8
+          FROM pg_stats s2
+          WHERE null_frac<>0 AND s2.schemaname = s.schemaname AND s2.tablename = s.tablename
+        ) AS nullhdr
+      FROM pg_stats s, (
+        SELECT
+          (SELECT current_setting('block_size')::numeric) AS bs,
+          CASE WHEN substring(v,12,3) IN ('8.0','8.1','8.2') THEN 27 ELSE 23 END AS hdr,
+          CASE WHEN v ~ 'mingw32' THEN 8 ELSE 4 END AS ma
+        FROM (SELECT version() AS v) AS foo
+      ) AS constants
+      GROUP BY 1,2,3,4,5
+    ) AS foo
+  ) AS rs
+  JOIN pg_class cc ON cc.relname = rs.tablename
+  JOIN pg_namespace nn ON cc.relnamespace = nn.oid AND nn.nspname = rs.schemaname AND nn.nspname <> 'information_schema'
+  LEFT JOIN pg_index i ON indrelid = cc.oid
+  LEFT JOIN pg_class c2 ON c2.oid = i.indexrelid
+) AS sml
+where (ROUND(CASE WHEN otta=0 THEN 0.0 ELSE sml.relpages/otta::numeric END,1) > $TABLE_BLOAT) and
+      (relpages < otta OR bs*(sml.relpages-otta)::bigint > $TABLE_WASTED_BYTES)
+ORDER BY wastedbytes DESC";
+
+    my @database_list = `psql -t -c "select datname from pg_database where datallowconn='t'"`;
+    my $db = "";
+    foreach my $r (@database_list) {
+	if ($r =~ m/(\w+)/) {
+	    $db = $1;
+    
+	    my @result = `psql -c "$sql" $db`;
+	    my $bad_table_bloat = "";
+	    my $tb = 0;
+
+	    foreach my $d (@result) {
+		if ($d =~ m/(\w+)\s*\|\s*(\d+.\d+)\s*\|\s*(\d+.\d+)/) {
+		    $bad_table_bloat .= "     $1: $2 bloat, $3 wasted bytes\n";
+		}
+	    }
+	    if ($bad_table_bloat eq "") {
+		print "$good $db: No table bloat\n";
+	    }
+	    else {
+		print "$bad $db: Table bloat for the following tables:\n$bad_table_bloat";
+	    }
+    }
+    # m/(\d+.\d+)\s*(\d+.\d+)\s*(\d+.\d+)/)   
+    }
+}
+
+# #--------------------------------------------------------------------------------
+sub health_queries {
+    print "\n- Queries -----------------------------------------\n";
+
+    #--------------------------------------------------
+    # Blocked queries
+    
+    my $sql = "select count(*) from (select
+               w.query as waiting_query,
+               w.pid as w_pid,
+               w.usename as w_user,
+               l.query as locking_query,
+               l.pid as l_pid,
+               l.usename as l_user,
+               t.schemaname || '.' || t.relname as tablename
+               from pg_stat_activity w
+               join pg_locks l1 on w.pid = l1.pid and not l1.granted
+               join pg_locks l2 on l1.relation = l2.relation and l2.granted
+               join pg_stat_activity l on l2.pid = l.pid
+               join pg_stat_user_tables t on l1.relation = t.relid
+               where w.waiting) as t";
+
+    my $result = `psql -c "$sql" postgres`;
+    if ($result =~ m/(\d)/) {
+	if ($1 == 0) {
+	    print "$good No blocked queries\n";
+	}
+	else {
+	    print "$bad There are $1 blocked queries\n";
+	}
+    }
+
+    #--------------------------------------------------
+    # Long running queries
+
+    $sql = "select max(current_timestamp - query_start) as maxruntime from pg_stat_activity
+where query != '<IDLE>'";
+    $result = `psql -c "$sql" postgres`;
+    my $H = 0;
+    my $M = 0;
+    my $S = 0;
+    if ($result =~ m/([0-9]{2})([0-9]{2}):([0-9]{2})/) {
+	$H = $1;
+	$M = $2;
+	$S = $3;
+    }
+    if (($H >0) or ($M > 0)) {
+	print "$bad Long running queries: max=" . sprintf("%2d",$H) . ":" . sprintf("%2d",$M) . ":" . sprintf("%2d",$S) . "\n";
+    }
+    else {
+	print "$good No long running queries: max=" .sprintf("%2d",$H) . ":" . sprintf("%2d",$M) . ":" . sprintf("%2d",$S) . "\n";
+    }
+
+}
+
+# #--------------------------------------------------------------------------------
+# Check indexes health
+
+sub health_index {
+    print "\n- Indexes -----------------------------------------\n";
+
+    #--------------------------------------------------
+    # Bloated indexes
+    
+    my $sql = "SELECT relname,
+       round(100 * pg_relation_size(indexrelid) / pg_relation_size(indrelid)) / 100 as index_ratio
+FROM pg_index i
+     LEFT JOIN pg_class c on (c.oid=i.indexrelid)
+     LEFT JOIN pg_namespace n on (n.oid=c.relnamespace)
+WHERE nspname not in ('pg_catalog', 'information_schema', 'pg_toast') AND
+      c.relkind = 'i' AND
+      pg_relation_size(indrelid) > 0";
+
+    my @result = `psql -c "$sql" postgres`;
+    my $bad_indexes = "";
+    my $index_ratio = 0;
+
+    foreach my $d (@result) {
+	if ($d =~ m/([0-9]+.[0-9]+)/) {
+	    $index_ratio = $1;
+	    if ($index_ratio > 2) {
+		if ($d =~ m/(\w+)/)
+		{$bad_indexes .= "     $1: ". $index_ratio ."\n"} #"hehe\n"} #$1;}
+	    }
+	}
+    }
+
+    if ($bad_indexes eq "") {
+	print "$good Index ratio < 2 for all indexes\n"; 
+    }
+    else {
+	print "$bad Poor Index Ratio for:\n$bad_indexes\n";
+    }
+
+    #--------------------------------------------------
+    # Duplicate index
+
+    
+    $sql = "SELECT (array_agg(idx))[1] AS idx1, (array_agg(idx))[2] AS idx2,
+            (array_agg(idx))[3] AS idx3, (array_agg(idx))[4] AS idx4
+            FROM (
+                     SELECT indexrelid::regclass AS idx, (indrelid::text ||E'\n'|| indclass::text ||E'\n'|| indkey::text ||E'\n'||
+                                         coalesce(indexprs::text,'')||E'\n' || coalesce(indpred::text,'')) AS KEY
+              FROM pg_index) sub
+             GROUP BY KEY HAVING count(*)>1
+             ORDER BY sum(pg_relation_size(idx)) DESC;";
+
+    my @database_list = `psql -t -c "select datname from pg_database where datallowconn='t'"`;
+    my $db = "";
+    my $ui_ok_list = "";
+    my $ui_ko_list = "";
+    
+    foreach my $r (@database_list) {
+    
+	if ($r =~ m/(\w+)/) {
+    	    $db = $1;
+	    #chomp ($r);
+	    $r =~ s/^\s+|\s+$//g;
+    
+	    my @result = `psql -t -c "$sql" $db`;
+#	    print "$db" . scalar @result . "_\n";
+	    if (scalar @result eq 1) {
+		$ui_ok_list .= "$r ";
+	    }
+#	    else { print "trouvé pour $db\n"}
+	    
+	    my $useless_indexes = "";
+	    my $tb = 0;
+	    my $useless_index_list = "";
+
+	    foreach my $d (@result) {
+#		if ($d =~ m/^\s+$/) {
+#		    print "rien trouvé pour $db !\n";
+#		}
+		if ($d =~ m/(\w+)/) {
+	    	    $d =~ s/^\s+|\s+$//g;
+		    $d =~ s/\||//g;
+		    $useless_index_list .= "$d\n"
+#		    print "$db: useless indexes: $d\n";
+		}
+	#	else {
+	#	    $ui_ok_list .= "$r ";
+	#	}
+		    
+	    }
+	    
+
+	    if ($useless_index_list ne "") {
+		$ui_ko_list .=  "$bad $r: Useless indexes\n     $useless_index_list";
+		#print "$bad $r: Useless indexes\n     $useless_index_list";
+	    }
+#	    if ($ui_ok_list ne "") {
+#		print "$good No useless indexes for $ui_ok_list\n";
+	    }
+	    
+#		if ($d =~ m/(\w+)\s*\|\s*(\d+.\d+)\s*\|\s*(\d+.\d+)/) {
+#		    $bad_table_bloat .= "     $1: $2 bloat, $3 wasted bytes\n";
+#		}
+#	    }
+#	    if ($bad_table_bloat eq "") {
+#		print "$good $db: No table bloat\n";
+#	    }
+#	    else {
+#		print "$bad $db: Table bloat for the following tables:\n$bad_table_bloat";
+#	    }
+    }
+    if ($ui_ko_list ne "") {
+      print $ui_ko_list;
+    }
+    if ($ui_ok_list ne ""){
+      print "$good No useless indexes for $ui_ok_list\n";
+    }
+
+}
+# #--------------------------------------------------------------------------------
+sub db_size {
+
+    my $sql = "SELECT d.datname AS Name,
+               pg_catalog.pg_get_userbyid(d.datdba) AS Owner,
+       CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT') THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))
+            ELSE 'No Access'
+       END AS Size
+FROM pg_catalog.pg_database d
+ORDER BY
+      CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT') THEN pg_catalog.pg_database_size(d.datname)
+           ELSE NULL
+      END DESC LIMIT 20 ";
+                       
+    system("psql -c \"$sql\" postgres");
+}
+
+
+# #--------------------------------------------------------------------------------
+sub blocking {
+
+    my $sql = "select
+	w.query as waiting_query,
+	w.pid as w_pid,
+	w.usename as w_user,
+	l.query as locking_query,
+	l.pid as l_pid,
+	l.usename as l_user,
+	t.schemaname || '.' || t.relname as tablename
+from pg_stat_activity w
+	join pg_locks l1 on w.pid = l1.pid and not l1.granted
+	join pg_locks l2 on l1.relation = l2.relation and l2.granted
+	join pg_stat_activity l on l2.pid = l.pid
+	join pg_stat_user_tables t on l1.relation = t.relid
+where w.waiting";
+
+    system("psql -c \"$sql\" postgres");
+}
+
+
+##---------------------------------------------------------------
+#CREATE OR REPLACE FUNCTION pg_doctor() RETURNS TABLE
+#	(mess_id int ,
+#	mess_importance integer,
+#	mess_type varchar(50),
+#	mess_text varchar(255),
+#	mess_solution varchar(255)) AS
+#$$
+#BEGIN
+#	drop table if exists mess_list;
+#	CREATE TEMPORARY TABLE mess_list (
+#	mess_id serial ,
+#	mess_importance integer,
+#	mess_type varchar(50),
+#	mess_text varchar(255),
+#	mess_solution varchar(255));
+#
+#	insert into mess_list(mess_importance,mess_type,mess_text, mess_solution) values(1,'SYSTEM','Check blabla...', 'http://www.postgresql.org/...');
+#	return query
+#	select * from mess_list;
+#
+##-------------------------------------------------------------------------------------
