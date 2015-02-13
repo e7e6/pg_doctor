@@ -2,6 +2,7 @@
 
 ##############################################
 # pg_doctor version 0.1
+# date 13/02/2015 
 # "omg such ugly code" first version
 # Tested on ubuntu 14.04,fedora 21
 # Should be launched as postgres user
@@ -34,10 +35,19 @@ my $good = "[\e[0;32mOK\e[0m]" ;
 my $bad  = "[\e[0;31mKO\e[0m]" ;
 my $info = "[\e[0;34m--\e[0m]" ;
 
+# Get the server version
+# FIXME: use it when generating SQL !!
+my @get_postgresql_version = `psql -t -c "select version() as version"`;
+my $POSTGRESQL_VERSION = "";
+if ($get_postgresql_version[0] =~ m/(\w+) (\d.\d)/) { $POSTGRESQL_VERSION = $2; }
+else { print "$bad Could not determine PostgreSQL version!!";  }
+
 # Getting some postgresql global variables
-my $postgresql_conf_sql = "select setting from pg_settings where name = 'data_directory'";
+my $postgresql_conf_sql    = "select setting from pg_settings where name in ('config_file', 'data_directory') order by name asc";
 my @postgresql_conf_result = `psql -t -c "$postgresql_conf_sql" postgres`;
-my $DATA_DIRECTORY = $postgresql_conf_result[0];
+my $POSTGRESQL_CONF_FILE   = $postgresql_conf_result[0];
+my $DATA_DIRECTORY         = $postgresql_conf_result[1];
+#print "conf = $POSTGRESQL_CONF_FILE and data = $DATA_DIRECTORY\n";
 
 my $arg0 = $ARGV[0];
 
@@ -47,152 +57,14 @@ elsif ($arg0 eq "health")               {&health}
 else                                    {&bad_arguments}
 
 # #--------------------------------------------------------------------------------
+# FIXME: remove health option
+# FIXME: add options for file redirection
+# IDEA: generate sql file to rebuild tables and indexes if needed 
 sub bad_arguments {
-    print "Utilisation: pg_doctor [OPTION] [DATABASE]
+    print "Use: pg_doctor [OPTION] [DATABASE]
            ...
            [OPTION]:
-             health               : analyse l'état du serveur\n"
-}
-
-# #--------------------------------------------------------------------------------
-# Connected users
-
-sub sessions {
-
-    my $sql = "
-        select *
-        from
-	(( select datname,
-                count(*)
- 	  from pg_stat_activity
-	  group by datname order by 1)
-	UNION
-	( select '_TOTAL_',
-	  count(*)
-	  from pg_stat_activity)) as listingsessions
-	order by datname";
-
-    system("psql -c \"$sql\" dummydb");
-}
-# #--------------------------------------------------------------------------------
-# Find cluster's uptime
-
-sub uptime{
-
-    my $sql = "select date_trunc('second',current_timestamp - pg_postmaster_start_time()) as uptime;";
-   system("psql -c \"$sql\" dummydb");
-
-}
-# #--------------------------------------------------------------------------------
-# Running queries
-
-sub queries{
-    my $sql = "select current_timestamp - query_start as runtime,
-                      pid,datname,usename,query
-               from pg_stat_activity
-               where query != '<IDLE>'
-               order by 1 desc";
-   system("psql -c \"$sql\" postgres");
-}
-# #--------------------------------------------------------------------------------
-# List server non-default settings
-
-sub non_default_settings {
-    my $sql = "select name, source, setting
-               from pg_settings
-               where source != 'default' and source != 'override' order by 1,2";
-    system("psql -c \"$sql\" postgres");
-}
-# #--------------------------------------------------------------------------------
-# Kill sessions, either for a database or a pid
-
-sub kill_proc {
-
-    my $arg1 = $ARGV[1];
-    if (not defined $arg1)      {&bad_arguments}
-    my $sql="";
-
-    # digit was entered, we try to kill the aforementionned pid
-    if ($arg1 =~ m/(\d+)/ ) {
-	$sql = "select count(pg_terminate_backend(pid)) as nb_killed_proc
-                from pg_stat_activity
-                where pid = $arg1";
-    }
-    else {
-	$sql = "select count(pg_terminate_backend(pid)) as nb_killed_proc
-	        from pg_stat_activity
-                where datname = '$arg1'";
-    }
-    system("psql -c \"$sql\" postgres");
-    
-}
-
-# #--------------------------------------------------------------------------------
-# Kill idle in transactions queries (>5m)
-
-sub kill_idle_proc {
-
-    my $sql="select count(pg_terminate_backend(pid)) as nb_killed_proc
-                from pg_stat_activity
-                where query = '<IDLE> in transaction' and
-                      current_timestamp - query_start > '5 min'";
-    system("psql -c \"$sql\" postgres");
-    
-}
-
-# #--------------------------------------------------------------------------------
-# Cancel sessions, either for a database or a pid
-
-sub cancel_proc {
-
-    my $arg1 = $ARGV[1];
-    if (not defined $arg1)      {&bad_arguments}
-    my $sql="";
-
-    # digit was entered, we try to kill the aforementionned pid
-    if ($arg1 =~ m/(\d+)/ ) {
-	$sql = "select count(pg_cancel_backend(pid)) as nb_cancelled_proc
-                from pg_stat_activity
-                where pid = $arg1";
-    }
-    else {
-	$sql = "select count(pg_cancel_backend(pid)) as nb_cancelled_proc
-	        from pg_stat_activity
-                where datname = '$arg1'";
-    }
-    system("psql -c \"$sql\" postgres");
-    
-}
-
-
-
-
-# #--------------------------------------------------------------------------------
-# BOF
-sub sauve_base {
-    
-    my $arg1 = $ARGV[1];
-    my $backup_name = "";
-    if (not defined $arg1)      {&bad_arguments}
-    else {
-	my $arg2 = $ARGV[2];
-	if (not defined $arg2) {
-	    $backup_name = "/tmp/" . $arg1 . "_" . localtime->strftime('%Y%m%d' . ".dmp");
-	}
-	else {
-	    $backup_name = $arg2;
-	}
-
-	print "Database $arg1: starting backup...\n";
-	my $res = `pg_dump $arg1 -Fc -f $backup_name`;
-
-	if ($? != 0) {
-	    print "Unable to backup database $arg1 !\n";
-	}
-	else {
-	    print "Backup OK: $backup_name\n";
-	}
-    }
+             health               : server's health\n"
 }
 
 # #--------------------------------------------------------------------------------
@@ -430,12 +302,23 @@ sub health_cluster_config {
 
 
    #--------------------------------------------------
-   # 
+   # Check uptime and see if it's been up for more than a day
+   
+   my $sql = "select date_trunc('second',current_timestamp - pg_postmaster_start_time()) as uptime;";
+   my @uptime = `psql -t -c "$sql" postgres`;
+   print "UPTIME = $uptime[0] \n";
+   if ($uptime[0] =~ m/\s*UPTIME\s*=\s*(\d+)/) {
+    print "dollar1 = $1\n";
+    if ($1 > 0) {print "Over one day :)\n"}
+    else {print "Less than one day :(\n"}
+   }
+   else { print "uptime pas trouvé\n"}
+
    #--------------------------------------------------
    # Connections
 
-   my $sql = "with maxconn(max) as (select setting as MAX from pg_settings where name = 'max_connections')
-, nbconn(nb) as (select count(*) as NB from pg_stat_activity )
+   $sql = "with maxconn(max) as (select setting as MAX from pg_settings where name = 'max_connections')
+, nbconn(nb) as (select count(*) as NB from pg_stat_activity where pid <> pg_backend_pid())
 select ((NB::float / MAX::float) * 100.0)::int as pct_connection, MAX::int - NB::int as left_connections, NB as nb_connections, MAX as max_connections
 from maxconn,nbconn";
 
@@ -461,7 +344,7 @@ from maxconn,nbconn";
 	}
     }
 
-    $sql = "select datname,count(*) from pg_stat_activity
+    $sql = "select datname,count(*) from pg_stat_activity where pid <> pg_backend_pid()
 	  group by datname order by datname";
     my $connections_listing = "";
     @result =  `psql -c "$sql" postgres`;
