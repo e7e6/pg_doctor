@@ -2,11 +2,10 @@
 
 ##############################################
 # pg_doctor version 0.1
-# date 13/02/2015 
 # "omg such ugly code" first version
 # Tested on ubuntu 14.04,fedora 21
 # Should be launched as postgres user
-# 
+# Usage: FIXME
 # 
 ##############################################
 
@@ -87,7 +86,7 @@ sub health_system_config {
 
    ##--------------------------------------------------
    # Check CPU Usage
-   # CORRECT ME - top command is not correct
+   # FIXME - top command is not correct
    my $cpu_top = `top -bn1 | grep "Cpu(s)" `;
    my $cpu = 0;
    # if ($cpu_top =~ m/Cpu\(s\):(.*?),/) {
@@ -100,7 +99,7 @@ sub health_system_config {
        }  
    }
     else {
-	print "did not recognise cpu\n";
+	print "Did not recognise cpu\n";
     }
       
    ##--------------------------------------------------
@@ -210,14 +209,15 @@ sub health_system_config {
 #       print "\t[OK]  dirty_background_ratio\n";
    }
 
+   #FIXME: add kernel.sched_migration_cost_ns= 5000000 and 
+   #       kernel.sched_autogroup_enabled = 0
+
    if ($sysctlconf_bad_results ne "") {
        print "$bad kernel settings :\n$sysctlconf_bad_results";
    }
    else {
        print "$good kernel configuration correct.\n"
    }
-	  
-
        
    #--------------------------------------------------
    # Check no atime config
@@ -243,7 +243,6 @@ sub health_system_config {
           # print "not found\n"
         }
     }
-
     
     if ($noatime eq '') {
       print "$bad Consider using noatime for the database partition\n"; 
@@ -269,23 +268,23 @@ sub health_cluster_config {
    # Rights and privileges
    # check postgresql.conf 
 
-#    my $filename_postgresql_conf = "/etc/postgresql/9.3/main/postgresql.conf";
-#    open (my $fh, '<:encoding(UTF-8)', $filename_postgresql_conf)
-#	or die "Could not open $filename_postgresql_conf !";
-#
-#    my $work_mem = "";
-#    my $effective_cache_size = "";
-#    
-#    while (my $line = <$fh>) {
-##	if ($line =~ m/work_mem(\w+)(\d+)/) { #(\w+)(\d+)/) {
-#    	if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
-#	    $work_mem = $1;
-#	    print "found it!!";
-#	}
-#	
-#    }
-#    print "------------> workmem =$work_mem.\n";
-#    # work_mem
+  #    my $filename_postgresql_conf = "/etc/postgresql/9.3/main/postgresql.conf";
+  #    open (my $fh, '<:encoding(UTF-8)', $filename_postgresql_conf)
+  #	or die "Could not open $filename_postgresql_conf !";
+  #
+  #    my $work_mem = "";
+  #    my $effective_cache_size = "";
+  #    
+  #    while (my $line = <$fh>) {
+  ##	if ($line =~ m/work_mem(\w+)(\d+)/) { #(\w+)(\d+)/) {
+  #    	if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
+  #	    $work_mem = $1;
+  #	    print "found it!!";
+  #	}
+  #	
+  #    }
+  #    print "------------> workmem =$work_mem.\n";
+  #    # work_mem
 
    #--------------------------------------------------
    # Check "weird" settings in postgresql.conf 
@@ -306,13 +305,12 @@ sub health_cluster_config {
    
    my $sql = "select date_trunc('second',current_timestamp - pg_postmaster_start_time()) as uptime;";
    my @uptime = `psql -t -c "$sql" postgres`;
-   print "UPTIME = $uptime[0] \n";
-   if ($uptime[0] =~ m/\s*UPTIME\s*=\s*(\d+)/) {
-    print "dollar1 = $1\n";
-    if ($1 > 0) {print "Over one day :)\n"}
-    else {print "Less than one day :(\n"}
+   #FIXME: dirty if
+   if ($uptime[0] =~ m/\s*(\d+) days/) {
+    #print "days = $1\n";
+    if ($1 == 0) {print "$info Uptime is less than a day. Some measurements might not be correct\n"}
    }
-   else { print "uptime pas trouvé\n"}
+   else {print "$info Uptime is less than a day. Some measurements might not be correct\n"}
 
    #--------------------------------------------------
    # Connections
@@ -322,7 +320,7 @@ sub health_cluster_config {
 select ((NB::float / MAX::float) * 100.0)::int as pct_connection, MAX::int - NB::int as left_connections, NB as nb_connections, MAX as max_connections
 from maxconn,nbconn";
 
-    my @result = `psql -c "$sql" postgres`;
+    my @result = `psql -t -c "$sql" postgres`;
     my $low_nb = 0;
 
     my $pct_connection   = 0;
