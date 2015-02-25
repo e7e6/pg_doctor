@@ -5,17 +5,17 @@
 # "omg such ugly code" first version
 # Tested on ubuntu 14.04,fedora 21
 # Should be launched as postgres user
-# Usage: FIXME
+# 
 # 
 ##############################################
 
 use strict;
 use warnings;
-# use Time::Piece;
+use Time::Piece;
 
 ##############################################
 # Global user variables
-
+   
 my $CPU_HIGH_USAGE = 50;
 my $TABLE_BLOAT = 2;
 my $TABLE_WASTED_BYTES = 100;
@@ -25,10 +25,9 @@ my $PARTITION_MIN_SPACE = 50;
 my $MAX_NB_LOCKS_PER_DATABASE = 500;
 
 #FIXME : use the alias
-my $psql_command = "psql --no-psqlrc";
+my $psql_command = "psql -qAtX";
 
 ##############################################
-
 # Color for the output
 my $good = "[\e[0;32mOK\e[0m]" ;
 my $bad  = "[\e[0;31mKO\e[0m]" ;
@@ -36,7 +35,7 @@ my $info = "[\e[0;34m--\e[0m]" ;
 
 # Get the server version
 # FIXME: use it when generating SQL !!
-my @get_postgresql_version = `psql -t -c "select version() as version"`;
+my @get_postgresql_version = `$psql_command -c "select version() as version"`;
 my $POSTGRESQL_VERSION = "";
 if ($get_postgresql_version[0] =~ m/(\w+) (\d.\d)/) { $POSTGRESQL_VERSION = $2; }
 else { print "$bad Could not determine PostgreSQL version!!";  }
@@ -48,11 +47,19 @@ my $POSTGRESQL_CONF_FILE   = $postgresql_conf_result[0];
 my $DATA_DIRECTORY         = $postgresql_conf_result[1];
 #print "conf = $POSTGRESQL_CONF_FILE and data = $DATA_DIRECTORY\n";
 
+# PG eol policy
+my %postgres_eol = (
+  '9.4' => '2019-12-01',
+  '9.3' => '2018-09-01',
+  '9.2' => '2017-09-01',
+  '9.1' => '2016-09-01',
+  '9.0' => '2015-09-01'
+  );
+
 my $arg0 = $ARGV[0];
 
-if (not defined $arg0)                  {&bad_arguments}
+if (not defined $arg0)                  {&health}
 elsif ($arg0 eq "--help")               {&bad_arguments}
-elsif ($arg0 eq "health")               {&health}
 else                                    {&bad_arguments}
 
 # #--------------------------------------------------------------------------------
@@ -60,10 +67,10 @@ else                                    {&bad_arguments}
 # FIXME: add options for file redirection
 # IDEA: generate sql file to rebuild tables and indexes if needed 
 sub bad_arguments {
-    print "Use: pg_doctor [OPTION] [DATABASE]
+    print "Use: pg_doctor [OPTION] 
            ...
            [OPTION]:
-             health               : server's health\n"
+             --help               : this message\n"
 }
 
 # #--------------------------------------------------------------------------------
@@ -118,7 +125,6 @@ sub health_system_config {
     
    ##--------------------------------------------------
    # Check Memory Usage
-   
    ##--------------------------------------------------
    # Disk free space
    
@@ -141,6 +147,10 @@ sub health_system_config {
     else {
 	print "$bad Not enough space on partitions: $low_space_list\n";
     }
+
+   ##--------------------------------------------------
+   # Memory: is the server swapping?
+   # FIXME: TODO
 
    #--------------------------------------------------
    # System settings found in /etc/sysctl.conf
@@ -209,8 +219,8 @@ sub health_system_config {
 #       print "\t[OK]  dirty_background_ratio\n";
    }
 
-   #FIXME: add kernel.sched_migration_cost_ns= 5000000 and 
-   #       kernel.sched_autogroup_enabled = 0
+   #FIXME: add kernel.sched_migration_cost_ns= 5000000  
+   #FIXME:     kernel.sched_autogroup_enabled = 0
 
    if ($sysctlconf_bad_results ne "") {
        print "$bad kernel settings :\n$sysctlconf_bad_results";
@@ -299,6 +309,19 @@ sub health_cluster_config {
    # max_connections?
    # shared_buffers ?
 
+   # Check if EOL version 
+   if (exists $postgres_eol{$POSTGRESQL_VERSION}) {
+       my $today = localtime->strftime('%Y-%m-%d');
+       if ($today ge $postgres_eol{$POSTGRESQL_VERSION}) {
+           print "$bad PostgresSQL $POSTGRESQL_VERSION is not supported since $postgres_eol{$POSTGRESQL_VERSION}\n";
+       }
+       else {
+            print "$good Running a supported version ($POSTGRESQL_VERSION)\n" 
+       }
+   }
+   else {
+       print "$bad PostgresSQL $POSTGRESQL_VERSION is not supported.\n";
+   }
 
    #--------------------------------------------------
    # Check uptime and see if it's been up for more than a day
