@@ -15,5 +15,5 @@ This is not meant as a monitoring tool. It should hopefully help users to see if
 TODO:
 - improve the perl side of things, as the code is very baby perl
 - improve comments
-- test on more systems
+- test on more systems. Requires Time::Piece, can be installed on Fedora with yum install perl-core
 - many checks to add on postgresql.conf parameters
