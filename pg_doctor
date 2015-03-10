@@ -3,7 +3,6 @@
 ##############################################
 # pg_doctor version 0.1
 # "omg such ugly code" first version
-# Tested on ubuntu 14.04,fedora 21
 # Should be launched as postgres user
 # 
 # 
@@ -24,7 +23,6 @@ my $MIN_CONNECTIONS_LEFT = 10;
 my $PARTITION_MIN_SPACE = 50;
 my $MAX_NB_LOCKS_PER_DATABASE = 500;
 
-#FIXME : use the alias
 my $psql_command = "psql -qAtX";
 
 ##############################################
@@ -42,10 +40,7 @@ else { print "$bad Could not determine PostgreSQL version!!";  }
 
 # Getting some postgresql global variables
 my $postgresql_conf_sql    = "select setting from pg_settings where name in ('config_file', 'data_directory') order by name asc";
-my @postgresql_conf_result = `psql -t -c "$postgresql_conf_sql" postgres`;
-my $POSTGRESQL_CONF_FILE   = $postgresql_conf_result[0];
-my $DATA_DIRECTORY         = $postgresql_conf_result[1];
-#print "conf = $POSTGRESQL_CONF_FILE and data = $DATA_DIRECTORY\n";
+my ($POSTGRESQL_CONF_FILE,$DATA_DIRECTORY) = `$psql_command -c "$postgresql_conf_sql" postgres`;
 
 # PG eol policy
 my %postgres_eol = (
@@ -64,8 +59,7 @@ else                                    {&bad_arguments}
 
 # #--------------------------------------------------------------------------------
 # FIXME: remove health option
-# FIXME: add options for file redirection
-# IDEA: generate sql file to rebuild tables and indexes if needed 
+# FIXME: add options for different output format
 sub bad_arguments {
     print "Use: pg_doctor [OPTION] 
            ...
@@ -98,16 +92,12 @@ sub health_system_config {
    my $cpu = 0;
    # if ($cpu_top =~ m/Cpu\(s\):(.*?),/) {
    if ($cpu_top =~ m/Cpu\(s\):\s*([0-9]+)/) {
-       if ($1 < $CPU_HIGH_USAGE) { 
-	   print "$good CPU Usage is normal ($1 %)\n";
-       }
-       else {
-	   print "$bad High CPU Usage ($1 %)\n";
-       }  
+       $1 < $CPU_HIGH_USAGE ? print "$good CPU Usage is normal ($1 %)\n" :
+                              print "$bad High CPU Usage ($1 %)\n";
    }
-    else {
-	print "Did not recognise cpu\n";
-    }
+   else {
+	   print "Did not recognise cpu\n";
+   }
       
    ##--------------------------------------------------
    # Check load
@@ -117,10 +107,10 @@ sub health_system_config {
 
    if ($cpu_load =~ m/(\d+.\d+)\s*(\d+.\d+)\s*(\d+.\d+)/) { # Cpu\(s\):(.*?),/)
        if ((($1 / $proc_nb) > 1) or (($2 / $proc_nb) > 1) or (($3 / $proc_nb) > 1)) {
-	   print "\t$bad High CPU Load ($1 $2 $3) \n";
+	       print "$bad High CPU Load ($1 $2 $3) \n";
        }
        else {
-	   print "$good CPU Load is normal ($1 $2 $3)\n";
+	       print "$good CPU Load is normal ($1 $2 $3)\n";
        }
     
    ##--------------------------------------------------
@@ -134,136 +124,129 @@ sub health_system_config {
         
     foreach my $d (@disk_space) {
     	if ($d =~ m/(\d+)\%\s\/(\w+)/) {
-	    #print "partition=$1 freespace=$1\n";
-	    if ($1 > $PARTITION_MIN_SPACE) {
-		$low_space_list .=  "$2= $1% ";
+    	    #print "partition=$1 freespace=$1\n";
+    	    if ($1 > $PARTITION_MIN_SPACE) {
+    		  $low_space_list .=  "$2= $1% ";
+	         }
 	    }
-	}
     }
 
-    if ($low_space_list eq "") {
-	print "$good Enough space on all partitions\n";
-    }
-    else {
-	print "$bad Not enough space on partitions: $low_space_list\n";
-    }
+    $low_space_list eq "" ? print "$good Enough space on all partitions\n" :
+                            print "$bad Not enough space on partitions: $low_space_list\n";
+    
 
    ##--------------------------------------------------
    # Memory: is the server swapping?
    # FIXME: TODO
 
    #--------------------------------------------------
-   # System settings found in /etc/sysctl.conf
-   #kernel.shmmax = 13421772800
-   #kernel.shmall = 20971520
+   # kernel settings
    
-   my $swappiness =  `cat /proc/sys/vm/swappiness`;
-   my $sysctlconf_bad_results = "";
-       
-   chomp($swappiness);
-   if ($swappiness > 10) {
-       #print "\t[NOK] vm.swappiness: $swappiness. Should be 0 < sw < 10.\n";
-       $sysctlconf_bad_results .= "     vm.swappiness: $swappiness. Should be 0 < sw < 10\n";
-   }
-   else {
-       #print "\t[OK]  vm.swappiness\n";
+   #--------------------------------------------------
+   # System settings found in /etc/sysctl.conf and elsewhere
+   # FIXME: improve documentation here
+   
+   my $proc_sys_bad_results = "";
+   
+   # check if version in 3.0<=k<=3.8 => very poor I/0 performance
+   my $kernel_version = `uname -r`;
+   if ($kernel_version =~ m/(\d+).(\d+)/) {
+    if ($1==3 and $2 >= 0 and $2 < 9) { 
+        #print "$bad Bad kernel = poor performances\n"; 
+        $proc_sys_bad_results .= "     Kernel version $1.$2 offers poor I/O performance\n";
+    }
+    else { 
+        print "$good Kernel version $1.$2 offers good I/O performance\n";
+    }
    }
 
+   my $swappiness =  `cat /proc/sys/vm/swappiness`;
+   chomp($swappiness);
+   if ($swappiness > 10) {
+       $proc_sys_bad_results .= "     vm.swappiness: $swappiness. Should be 0 < sw < 10\n";
+   }
+   
    my $dirty_ratio =  `cat /proc/sys/vm/dirty_ratio`;
    chomp($dirty_ratio);
    if ($dirty_ratio != 2) {
-#       print "\t[NOK] dirty_ratio: $dirty_ratio. Should be dr = 2.\n";
-       $sysctlconf_bad_results .= "     dirty_ratio: $dirty_ratio. Should be dr = 2\n";
+       $proc_sys_bad_results .= "     dirty_ratio: $dirty_ratio. Should be dr = 2\n";
    }
-   else {
-#       print "\t[OK]  dirty_ratio\n";
-   }
-
+   
    my $overcommit_memory =  `cat /proc/sys/vm/overcommit_memory`;
    chomp($overcommit_memory);
    if ($overcommit_memory != 2) {
-       #print "\t[NOK] overcommit_memory: $overcommit_memory. Should be om = 2.\n";
-       $sysctlconf_bad_results .= "     overcommit_memory: $overcommit_memory. Should be om = 2 on a dedicated box.\n";       
+       $proc_sys_bad_results .= "     overcommit_memory: $overcommit_memory. Should be om = 2 on a dedicated box.\n";       
    }
-   else {
-#      print "\t[OK]  overcommit_memory\n";
-   }
-
+   
    my $overcommit_ratio =  `cat /proc/sys/vm/overcommit_ratio`;
    chomp($overcommit_ratio);
    if ($overcommit_ratio != 80) {
-  #     print "\t[NOK] overcommit_ratio: $overcommit_ratio. Should be or = 80.\n";
-       $sysctlconf_bad_results .= "     overcommit_ratio: $overcommit_ratio. Should be or = 80.\n";       
+       $proc_sys_bad_results .= "     overcommit_ratio: $overcommit_ratio. Should be or = 80.\n";       
    }
-   else {
-#       print "\t[OK]  overcommit_ratio\n";
-   }
-
+   
    my $zone_reclaim_mode =  `cat /proc/sys/vm/zone_reclaim_mode`;
    chomp($zone_reclaim_mode);
    if ($zone_reclaim_mode != 0) {
- #      print "\t[NOK] zone_reclaim_mode: $zone_reclaim_mode. Should be zrm = 0.\n";
-       $sysctlconf_bad_results .= "     zone_reclaim_mode: $zone_reclaim_mode. Should be zrm = 0\n";              
+       $proc_sys_bad_results .= "     zone_reclaim_mode: $zone_reclaim_mode. Should be zrm = 0\n";              
    }
-   else {
-#       print "\t[OK]  zone_reclaim_mode\n";
-   }
-
+   
    my $dirty_background_ratio =  `cat /proc/sys/vm/dirty_background_ratio`;
    chomp($dirty_background_ratio);
    if ($dirty_background_ratio != 1) {
-#       print "\t[NOK] dirty_background_ratio: $dirty_background_ratio. Should be dbr = 1.\n";
-       $sysctlconf_bad_results .= "     dirty_background_ratio: $dirty_background_ratio. Should be dbr = 1\n";       
+       $proc_sys_bad_results .= "     dirty_background_ratio: $dirty_background_ratio. Should be dbr = 1\n";       
    }
-   else {
-#       print "\t[OK]  dirty_background_ratio\n";
+   
+   my $kernel_sched_migration_cost_ns = `cat /proc/sys/kernel/sched_migration_cost_ns`;
+   chomp ($kernel_sched_migration_cost_ns);
+   if ($kernel_sched_migration_cost_ns != 5000000) {
+       $proc_sys_bad_results .= "     kernel.sched_migration_cost_ns: $kernel_sched_migration_cost_ns. Should be ksmcn = 5000000\n";       
    }
 
-   #FIXME: add kernel.sched_migration_cost_ns= 5000000  
-   #FIXME:     kernel.sched_autogroup_enabled = 0
+   my $kernel_sched_autogroup_enabled = `cat /proc/sys/kernel/sched_autogroup_enabled`;
+   chomp ($kernel_sched_autogroup_enabled);
+   if ($kernel_sched_autogroup_enabled != 0) {
+       $proc_sys_bad_results .= "     kernel.sched_autogroup_enabled: $kernel_sched_autogroup_enabled. Should be ksae = 0\n";       
+   }
 
-   if ($sysctlconf_bad_results ne "") {
-       print "$bad kernel settings :\n$sysctlconf_bad_results";
-   }
-   else {
-       print "$good kernel configuration correct.\n"
-   }
-       
+   $proc_sys_bad_results ne "" ? print "$bad Kernel settings :\n$proc_sys_bad_results" : 
+                                 print "$good Kernel configuration correct.\n"
+   
+   
    #--------------------------------------------------
    # Check no atime config
    # FIXME: Very dummy check so far
    # Should be improved to see if $data_directory is really a noatime partition
 
-    my $filename_fstab = "/etc/fstab";
-    open (my $fh, '<:encoding(UTF-8)', $filename_fstab)
-	 or die "Could not open $filename_fstab !";
-#
-#    my $work_mem = "";
-    my $noatime = "";
-#    
-    while (my $line = <$fh>) {
-      if (($line =~ m/noatime/) and ($line !~ m/\s*#/)) { 
-          $noatime .= "Noatime found for a partition";
-          #print "boot found with option !\n";
-        #if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
-        #  $work_mem = $1;
-        #  print "found it!!";
-        }
-        else {
-          # print "not found\n"
-        }
-    }
+#     my $filename_fstab = "/etc/fstab";
+#     open (my $fh, '<:encoding(UTF-8)', $filename_fstab)
+# 	 or die "Could not open $filename_fstab !";
+# #
+# #    my $work_mem = "";
+#     my $noatime = "";
+# #    
+#     while (my $line = <$fh>) {
+#       if (($line =~ m/noatime/) and ($line !~ m/\s*#/)) { 
+#           $noatime .= "Noatime found for a partition";
+#           #print "boot found with option !\n";
+#         #if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
+#         #  $work_mem = $1;
+#         #  print "found it!!";
+#         }
+#         else {
+#           # print "not found\n"
+#         }
+#     }
     
-    if ($noatime eq '') {
-      print "$bad Consider using noatime for the database partition\n"; 
-    }
-    else {
-      print "$good $noatime - check your /etc/fstab\n";
-    }
+#     if ($noatime eq '') {
+#       print "$bad Consider using noatime for the database partition\n"; 
+#     }
+#     else {
+#       print "$good $noatime - check your /etc/fstab\n";
+#     }
 
 
    #--------------------------------------------------
-   # Check dedicated partition for data files and wal
+   # FIXME: Check dedicated partition for data files and wal
    
 
    }
@@ -275,28 +258,6 @@ sub health_cluster_config {
     print "\n- Cluster configuration -------------------------\n";
 
    #--------------------------------------------------
-   # Rights and privileges
-   # check postgresql.conf 
-
-  #    my $filename_postgresql_conf = "/etc/postgresql/9.3/main/postgresql.conf";
-  #    open (my $fh, '<:encoding(UTF-8)', $filename_postgresql_conf)
-  #	or die "Could not open $filename_postgresql_conf !";
-  #
-  #    my $work_mem = "";
-  #    my $effective_cache_size = "";
-  #    
-  #    while (my $line = <$fh>) {
-  ##	if ($line =~ m/work_mem(\w+)(\d+)/) { #(\w+)(\d+)/) {
-  #    	if ($line =~ m/\s*work_mem(\w+)(\d+)/) { 
-  #	    $work_mem = $1;
-  #	    print "found it!!";
-  #	}
-  #	
-  #    }
-  #    print "------------> workmem =$work_mem.\n";
-  #    # work_mem
-
-   #--------------------------------------------------
    # Check "weird" settings in postgresql.conf 
    # FIXME
    # autovacuum disabled / ...
@@ -304,10 +265,38 @@ sub health_cluster_config {
    # work_mem : around 8MB RAM below 32GB 16MB RAM below 64GB
    # look at maintenance_work_mem around 1GB ?
    # archive_mode = on ?
+   # fsync = off??
    # max_wal_senders = around 5 ?
    # effective_cache_size 
    # max_connections?
    # shared_buffers ?
+
+   my $sql = "select name, setting from pg_settings where name in 
+              ('archive_mode','autovacuum', 'fsync', 'max_wal_senders','max_connections')";
+    my @result = `$psql_command -c "$sql" postgres`;
+    my %pg_settings; 
+    
+   foreach my $setting (@result) {
+        if ($setting =~ m/(\w+)\s*\|\s*(\w+)/) {
+            $pg_settings{$1} = $2;
+        }
+   }
+
+   print "$info Archiving is not configured\n" if $pg_settings{'archive_mode'} ne "on";
+
+   print "$bad Autovacuum is not configured\n" if $pg_settings{'autovacuum'} ne "on";
+
+   print "$bad Fsync is off! This might lead to corruption problems\n" if $pg_settings{'fsync'} eq "off";
+
+   if ($pg_settings{'max_connections'} > 99 and $pg_settings{'max_connections'} <1000 ) {
+        print "$info Maximum number of connections is $pg_settings{'max_connections'}\n";
+   }
+   elsif ($pg_settings{'max_connections'} >= 1000) {
+        print "$bad Maximum connections ($pg_settings{'max_connections'}) is too high. Consider reducing it or using a pooler\n";
+   }
+
+   print "$bad Few wal_senders\n" if $pg_settings{'max_wal_senders'} < 5;
+
 
    # Check if EOL version 
    if (exists $postgres_eol{$POSTGRESQL_VERSION}) {
@@ -320,18 +309,19 @@ sub health_cluster_config {
        }
    }
    else {
-       print "$bad PostgresSQL $POSTGRESQL_VERSION is not supported.\n";
+       print "$bad PostgresSQL $POSTGRESQL_VERSION is not supported\n";
    }
 
    #--------------------------------------------------
    # Check uptime and see if it's been up for more than a day
    
-   my $sql = "select date_trunc('second',current_timestamp - pg_postmaster_start_time()) as uptime;";
-   my @uptime = `psql -t -c "$sql" postgres`;
+   $sql = "select date_trunc('second',current_timestamp - pg_postmaster_start_time()) as uptime;";
+   my @uptime = `$psql_command -c "$sql" postgres`;
    #FIXME: dirty if
    if ($uptime[0] =~ m/\s*(\d+) days/) {
-    #print "days = $1\n";
-    if ($1 == 0) {print "$info Uptime is less than a day. Some measurements might not be correct\n"}
+        if ($1 == 0) {
+            print "$info Uptime is less than a day. Some measurements might not be correct\n";
+        }
    }
    else {print "$info Uptime is less than a day. Some measurements might not be correct\n"}
 
@@ -343,7 +333,7 @@ sub health_cluster_config {
 select ((NB::float / MAX::float) * 100.0)::int as pct_connection, MAX::int - NB::int as left_connections, NB as nb_connections, MAX as max_connections
 from maxconn,nbconn";
 
-    my @result = `psql -t -c "$sql" postgres`;
+    @result = `$psql_command -c "$sql" postgres`;
     my $low_nb = 0;
 
     my $pct_connection   = 0;
@@ -352,7 +342,6 @@ from maxconn,nbconn";
     my $max_connections  = 0;
     
     foreach my $d (@result) {
-#	if ($d =~ m/(\d+)\s*+(\d+)\s+(\d+)\s+(\d+)/) {
     	if ($d =~ m/(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)/) {
 
 	    $pct_connection   = $1;
@@ -360,7 +349,7 @@ from maxconn,nbconn";
 	    $nb_connections   = $3;
 	    $max_connections  = $4;
 	    if (($pct_connection > $PCT_MAX_CONNECTIONS) or ($left_connections < $MIN_CONNECTIONS_LEFT)) {
-		$low_nb = 1;
+		  $low_nb = 1;
 	    }
 	}
     }
@@ -368,20 +357,16 @@ from maxconn,nbconn";
     $sql = "select datname,count(*) from pg_stat_activity where pid <> pg_backend_pid()
 	  group by datname order by datname";
     my $connections_listing = "";
-    @result =  `psql -c "$sql" postgres`;
+    @result =  `$psql_command -c "$sql" postgres`;
 
     foreach my $db (@result) {
-	if ($db =~ m/(\w+)\s*\|\s*(\d+)/) {
-	    $connections_listing .= "     $1: $2 session(s)\n";
-	}
+    	if ($db =~ m/(\w+)\s*\|\s*(\d+)/) {
+    	    $connections_listing .= "     $1: $2 session(s)\n";
+    	}
     }
     
-    if ($low_nb == 0) {
-	print "$good Connected sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing"; 
-    }
-    else {
-	print "$bad High number of sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing";
-    }
+    $low_nb == 0 ? print "$good Connected sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing" : 
+                   print "$bad High number of sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing";
 
 
 }
@@ -392,13 +377,13 @@ sub health_databases {
     #--------------------------------------------------
     # Buffer cache hit ratio 
     my $sql = "select datname, blks_hit::float/(blks_hit+blks_read) as hit_ratio from pg_stat_database where blks_read+blks_hit <> 0";
-    my @result = `psql -c "$sql" postgres`;
+    my @result = `$psql_command -c "$sql" postgres`;
     my $bad_bchr_db = "";
     my $good_bchr_db = "";
     my $bchr = 0;
 
     foreach my $d (@result) {
-	if ($d =~ m/([0-9]+.[0-9]+)/) {
+	if ($d =~ m/\|([0-9]+.[0-9]+)/) {
 	    $bchr = int(10000 * $1);
 	    if ($bchr < 9995) {
 		if ($d =~ m/(\w+)/) {
@@ -414,20 +399,20 @@ sub health_databases {
     }
     
     if ($good_bchr_db ne "") {
-	print "$good Good buffer cache hit ratio for:\n     $good_bchr_db\n";
+	   print "$good Good buffer cache hit ratio for:\n     $good_bchr_db\n";
     }
     elsif ($bad_bchr_db ne "") {
-	print "$bad Bad buffer cache hit ratio for:\n     $bad_bchr_db\n";
+	   print "$bad Bad buffer cache hit ratio for:\n     $bad_bchr_db\n";
     }
     else {
-	print "$info Not enough data to calculate buffer cache hit ratio\n"
+	   print "$info Not enough data to calculate buffer cache hit ratio\n"
     }
 
     #--------------------------------------------------
     # Number of locks per database
     # FIX ME
     $sql = "select d.datname, count(*) from pg_database d left join pg_locks l on d.oid = l.database group by d.datname;";
-    my @nb_locks_list = `psql -t -c "$sql" postgres`;
+    my @nb_locks_list = `$psql_command -c "$sql" postgres`;
     my $database_locks_ok = "";
     my $database_locks_ko = "";
     foreach my $r (@nb_locks_list) {
@@ -460,7 +445,6 @@ sub health_tables {
     #--------------------------------------------------
     # Check table bloat
     # see wiki.postgresql.org/wiki/Show_database_bloat
-    
     
     my $sql = " SELECT tablename, 
   ROUND(CASE WHEN otta=0 THEN 0.0 ELSE sml.relpages/otta::numeric END,1) AS tbloat,
@@ -506,30 +490,28 @@ where (ROUND(CASE WHEN otta=0 THEN 0.0 ELSE sml.relpages/otta::numeric END,1) > 
       (relpages < otta OR bs*(sml.relpages-otta)::bigint > $TABLE_WASTED_BYTES)
 ORDER BY wastedbytes DESC";
 
-    my @database_list = `psql -t -c "select datname from pg_database where datallowconn='t'"`;
+    my @database_list = `$psql_command -c "select datname from pg_database where datallowconn='t'"`;
     my $db = "";
+    my $table_bloat_ok = "";
     foreach my $r (@database_list) {
-	if ($r =~ m/(\w+)/) {
-	    $db = $1;
-    
-	    my @result = `psql -c "$sql" $db`;
-	    my $bad_table_bloat = "";
-	    my $tb = 0;
+    	if ($r =~ m/(\w+)/) {
+    	    $db = $1;
+        
+    	    my @result = `$psql_command -c "$sql" $db`;
+    	    my $bad_table_bloat = "";
+    	    my $tb = 0;
 
-	    foreach my $d (@result) {
-		if ($d =~ m/(\w+)\s*\|\s*(\d+.\d+)\s*\|\s*(\d+.\d+)/) {
-		    $bad_table_bloat .= "     $1: $2 bloat, $3 wasted bytes\n";
-		}
-	    }
-	    if ($bad_table_bloat eq "") {
-		print "$good $db: No table bloat\n";
-	    }
-	    else {
-		print "$bad $db: Table bloat for the following tables:\n$bad_table_bloat";
-	    }
+    	    foreach my $d (@result) {
+        		if ($d =~ m/(\w+)\s*\|\s*(\d+.\d+)\s*\|\s*(\d+.\d+)/) {
+        		    $bad_table_bloat .= "     $1: $2 bloat, $3 wasted bytes\n";
+        		}
+    	    }
+    	    $bad_table_bloat eq "" ? $table_bloat_ok .= " $db" :
+        	                         print "$bad $db: Table bloat for the following tables:\n$bad_table_bloat";
+    	    
+        } 
     }
-    # m/(\d+.\d+)\s*(\d+.\d+)\s*(\d+.\d+)/)   
-    }
+    print "$good No table bloat for:\n    $table_bloat_ok\n" if $table_bloat_ok ne "";
 }
 
 # #--------------------------------------------------------------------------------
@@ -554,22 +536,19 @@ sub health_queries {
                join pg_stat_user_tables t on l1.relation = t.relid
                where w.waiting) as t";
 
-    my $result = `psql -c "$sql" postgres`;
+    my $result = `$psql_command -c "$sql" postgres`;
     if ($result =~ m/(\d)/) {
-	if ($1 == 0) {
-	    print "$good No blocked queries\n";
-	}
-	else {
-	    print "$bad There are $1 blocked queries\n";
-	}
+    	$1 == 0 ? print "$good No blocked queries\n" :
+                  print "$bad There are $1 blocked queries\n";
     }
 
     #--------------------------------------------------
     # Long running queries
+    # FIXME: add some extra comments
 
     $sql = "select max(current_timestamp - query_start) as maxruntime from pg_stat_activity
 where query != '<IDLE>'";
-    $result = `psql -c "$sql" postgres`;
+    $result = `$psql_command -c "$sql" postgres`;
     my $H = 0;
     my $M = 0;
     my $S = 0;
@@ -579,10 +558,10 @@ where query != '<IDLE>'";
 	$S = $3;
     }
     if (($H >0) or ($M > 0)) {
-	print "$bad Long running queries: max=" . sprintf("%2d",$H) . ":" . sprintf("%2d",$M) . ":" . sprintf("%2d",$S) . "\n";
+	   print "$bad Long running queries: max=" . sprintf("%2d",$H) . ":" . sprintf("%2d",$M) . ":" . sprintf("%2d",$S) . "\n";
     }
     else {
-	print "$good No long running queries: max=" .sprintf("%2d",$H) . ":" . sprintf("%2d",$M) . ":" . sprintf("%2d",$S) . "\n";
+	   print "$good No long running queries: max=" .sprintf("%2d",$H) . ":" . sprintf("%2d",$M) . ":" . sprintf("%2d",$S) . "\n";
     }
 
 }
@@ -605,30 +584,27 @@ WHERE nspname not in ('pg_catalog', 'information_schema', 'pg_toast') AND
       c.relkind = 'i' AND
       pg_relation_size(indrelid) > 0";
 
-    my @result = `psql -c "$sql" postgres`;
+    my @result = `$psql_command -c "$sql" postgres`;
     my $bad_indexes = "";
     my $index_ratio = 0;
 
     foreach my $d (@result) {
-	if ($d =~ m/([0-9]+.[0-9]+)/) {
-	    $index_ratio = $1;
-	    if ($index_ratio > 2) {
-		if ($d =~ m/(\w+)/)
-		{$bad_indexes .= "     $1: ". $index_ratio ."\n"} #"hehe\n"} #$1;}
-	    }
-	}
+    	if ($d =~ m/([0-9]+.[0-9]+)/) {
+    	    $index_ratio = $1;
+    	    if ($index_ratio > 2) {
+        		if ($d =~ m/(\w+)/){
+                    $bad_indexes .= "     $1: ". $index_ratio ."\n"
+                } 
+    	    }
+    	}
     }
 
-    if ($bad_indexes eq "") {
-	print "$good Index ratio < 2 for all indexes\n"; 
-    }
-    else {
-	print "$bad Poor Index Ratio for:\n$bad_indexes\n";
-    }
+    $bad_indexes eq "" ? print "$good Index ratio < 2 for all indexes\n" :
+                       	 print "$bad Poor Index Ratio for:\n$bad_indexes\n";
 
     #--------------------------------------------------
     # Duplicate index
-
+    # FIXME: very poor code there, add commments
     
     $sql = "SELECT (array_agg(idx))[1] AS idx1, (array_agg(idx))[2] AS idx2,
             (array_agg(idx))[3] AS idx3, (array_agg(idx))[4] AS idx4
@@ -639,112 +615,48 @@ WHERE nspname not in ('pg_catalog', 'information_schema', 'pg_toast') AND
              GROUP BY KEY HAVING count(*)>1
              ORDER BY sum(pg_relation_size(idx)) DESC;";
 
-    my @database_list = `psql -t -c "select datname from pg_database where datallowconn='t'"`;
+    my @database_list = `$psql_command -c "select datname from pg_database where datallowconn='t'"`;
     my $db = "";
     my $ui_ok_list = "";
     my $ui_ko_list = "";
-    
+    my $useless_index_list = "";
     foreach my $r (@database_list) {
     
 	if ($r =~ m/(\w+)/) {
-    	    $db = $1;
+    	$db = $1;
 	    #chomp ($r);
 	    $r =~ s/^\s+|\s+$//g;
     
-	    my @result = `psql -t -c "$sql" $db`;
-#	    print "$db" . scalar @result . "_\n";
-	    if (scalar @result eq 1) {
-		$ui_ok_list .= "$r ";
-	    }
-#	    else { print "trouvé pour $db\n"}
-	    
-	    my $useless_indexes = "";
-	    my $tb = 0;
-	    my $useless_index_list = "";
+	    my @result = `$psql_command -c "$sql" $db`;
+	    #print "boucle @result\n";
 
-	    foreach my $d (@result) {
-#		if ($d =~ m/^\s+$/) {
-#		    print "rien trouvé pour $db !\n";
-#		}
-		if ($d =~ m/(\w+)/) {
-	    	    $d =~ s/^\s+|\s+$//g;
-		    $d =~ s/\||//g;
-		    $useless_index_list .= "$d\n"
-#		    print "$db: useless indexes: $d\n";
-		}
+        if (not @result) {
+            #print "nothin in $db\n";
+            $ui_ok_list .= "$r ";
+        }
+        else {
+    	    
+    	    my $useless_indexes = "";
+    	    my $tb = 0;
+
+    	    foreach my $d (@result) {
+                chomp($d);
+                $d =~ s/\|/ /g;
+    		    $useless_index_list .= "$d\n";
+    		    print "$bad $r: Useless indexes\n     $useless_index_list";
+            }
+    		#}
 	#	else {
 	#	    $ui_ok_list .= "$r ";
 	#	}
-		    
+		}    
 	    }
-	    
-
-	    if ($useless_index_list ne "") {
-		$ui_ko_list .=  "$bad $r: Useless indexes\n     $useless_index_list";
-		#print "$bad $r: Useless indexes\n     $useless_index_list";
+        $useless_index_list="";
 	    }
-#	    if ($ui_ok_list ne "") {
-#		print "$good No useless indexes for $ui_ok_list\n";
-	    }
-	    
-#		if ($d =~ m/(\w+)\s*\|\s*(\d+.\d+)\s*\|\s*(\d+.\d+)/) {
-#		    $bad_table_bloat .= "     $1: $2 bloat, $3 wasted bytes\n";
-#		}
-#	    }
-#	    if ($bad_table_bloat eq "") {
-#		print "$good $db: No table bloat\n";
-#	    }
-#	    else {
-#		print "$bad $db: Table bloat for the following tables:\n$bad_table_bloat";
-#	    }
-    }
-    if ($ui_ko_list ne "") {
-      print $ui_ko_list;
-    }
-    if ($ui_ok_list ne ""){
-      print "$good No useless indexes for $ui_ok_list\n";
-    }
+    
+    print "$good No useless indexes for:\n     $ui_ok_list\n" if $ui_ok_list ne "";
 
 }
-# #--------------------------------------------------------------------------------
-sub db_size {
-
-    my $sql = "SELECT d.datname AS Name,
-               pg_catalog.pg_get_userbyid(d.datdba) AS Owner,
-       CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT') THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))
-            ELSE 'No Access'
-       END AS Size
-FROM pg_catalog.pg_database d
-ORDER BY
-      CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT') THEN pg_catalog.pg_database_size(d.datname)
-           ELSE NULL
-      END DESC LIMIT 20 ";
-                       
-    system("psql -c \"$sql\" postgres");
-}
-
-
-# #--------------------------------------------------------------------------------
-sub blocking {
-
-    my $sql = "select
-	w.query as waiting_query,
-	w.pid as w_pid,
-	w.usename as w_user,
-	l.query as locking_query,
-	l.pid as l_pid,
-	l.usename as l_user,
-	t.schemaname || '.' || t.relname as tablename
-from pg_stat_activity w
-	join pg_locks l1 on w.pid = l1.pid and not l1.granted
-	join pg_locks l2 on l1.relation = l2.relation and l2.granted
-	join pg_stat_activity l on l2.pid = l.pid
-	join pg_stat_user_tables t on l1.relation = t.relid
-where w.waiting";
-
-    system("psql -c \"$sql\" postgres");
-}
-
 
 ##---------------------------------------------------------------
 #CREATE OR REPLACE FUNCTION pg_doctor() RETURNS TABLE
