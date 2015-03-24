@@ -262,7 +262,6 @@ sub health_cluster_config {
     #--------------------------------------------------
     # Check "weird" settings in postgresql.conf 
     # FIXME
-    # autovacuum disabled / ...
     # see if (work_mem) * max_connections + maintenance_workers * maintenance_mem too close to RAM	
     # work_mem : around 8MB RAM below 32GB 16MB RAM below 64GB
     # look at maintenance_work_mem around 1GB ?
@@ -270,7 +269,7 @@ sub health_cluster_config {
     # shared_buffers ?
 
     my $sql = "select name, setting from pg_settings where name in 
-              ('archive_mode','autovacuum', 'fsync', 'max_wal_senders','max_connections')";
+              ('archive_mode','autovacuum','checkpoint_segments', 'effective_cache_size', 'fsync', 'maintenance_work_mem', 'max_wal_senders','max_connections')";
     my @result = `$psql_command -c "$sql" postgres`;
     my %pg_settings; 
     
@@ -293,9 +292,19 @@ sub health_cluster_config {
         print "$bad Maximum connections ($pg_settings{'max_connections'}) is too high. Consider reducing it or using a pooler\n";
     }
 
-    print "$bad Few wal_senders\n" if $pg_settings{'max_wal_senders'} < 5;
+    print "$bad Few wal_senders. Are you sure $pg_settings{'max_wal_senders'} is enough?\n" if $pg_settings{'max_wal_senders'} < 5;
+
+    print "$info check_point_segments looks rather low. Checkpoints might be resource intensive\n" if $pg_settings{'checkpoint_segments'} < 10;
 
 
+    #FIXME: maintenance_work_mem
+    
+    #FIXME: effective_cache_size
+    my $memtotal =  `cat /proc/meminfo | grep MemTotal`;
+    chomp($memtotal);
+    #print "memtotal: $memtotal\n";
+    #print "$pg_settings{'effective_cache_size'}\n";
+    
     # Check if EOL version 
     if (exists $postgres_eol{$POSTGRESQL_VERSION}) {
         my $today = localtime->strftime('%Y-%m-%d');
@@ -606,7 +615,7 @@ sub health_index {
     	if ($d =~ m/([0-9]+.[0-9]+)/) {
     	    $index_ratio = $1;
     	    if ($index_ratio > 2) {
-        		if ($d =~ m/(\w+)/){
+        		if ($d =~ m/(\w+)/){rst
                     $bad_indexes .= "     $1: ". $index_ratio ."\n"
                 } 
     	    }
