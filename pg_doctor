@@ -100,6 +100,9 @@ sub health_system_config {
     else {
         print "Did not recognise cpu\n";
     }
+    
+    ##--------------------------------------------------
+    # FIXME: check if 32 or 64 bits with uname -m
 
     ##--------------------------------------------------
     # Check load
