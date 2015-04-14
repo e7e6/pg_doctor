@@ -32,7 +32,8 @@ my $bad  = "[\e[0;31mKO\e[0m]";
 my $info = "[\e[0;34m--\e[0m]";
 
 # Get the server version
-my @get_postgresql_version = `$psql_command -c "select version() as version"`;
+my @get_postgresql_version = `$psql_command -c "select version() as version" 2>/dev/null` or die "$bad Looks like PostgreSQL is not running...\n     Exiting\n";
+
 my $POSTGRESQL_VERSION = "";
 if ($get_postgresql_version[0] =~ m/(\w+) (\d.\d)/) { 
     $POSTGRESQL_VERSION = $2; 
@@ -75,6 +76,7 @@ sub bad_arguments {
 sub health {
     &health_system_config;
     &health_cluster_config;
+    &health_roles;
     &health_databases;
     &health_tables;
     &health_queries;
@@ -86,6 +88,12 @@ sub health {
 
 sub health_system_config {
     print "\n- System ----------------------------------------\n";
+
+    ##--------------------------------------------------
+    # 32 bits or 64 bits
+    my $architecture = `uname -m`;
+    ($architecture =~ m/x86_64/) ? print "$good Using x86_64 \n" :
+                                   print "info Not using x86_64 \n";
 
     ##--------------------------------------------------
     # Check CPU Usage
@@ -100,9 +108,6 @@ sub health_system_config {
     else {
         print "Did not recognise cpu\n";
     }
-    
-    ##--------------------------------------------------
-    # FIXME: check if 32 or 64 bits with uname -m
 
     ##--------------------------------------------------
     # Check load
@@ -118,8 +123,6 @@ sub health_system_config {
 	       print "$good CPU Load is normal ($1 $2 $3)\n";
         }
     } 
-    ##--------------------------------------------------
-    # Check Memory Usage
     ##--------------------------------------------------
     # Disk free space
    
@@ -141,13 +144,16 @@ sub health_system_config {
     
 
     ##--------------------------------------------------
+    # Check Memory Usage
+    # FIXME: TODO
+   
+
+    ##--------------------------------------------------
     # Memory: is the server swapping?
     # FIXME: TODO
 
     #--------------------------------------------------
     # kernel settings
-      
-    #--------------------------------------------------
     # System settings found in /etc/sysctl.conf and elsewhere
     # FIXME: improve documentation here
    
@@ -272,7 +278,7 @@ sub health_cluster_config {
     # shared_buffers ?
 
     my $sql = "select name, setting from pg_settings where name in 
-              ('archive_mode','autovacuum','checkpoint_segments', 'effective_cache_size', 'fsync', 'maintenance_work_mem', 'max_wal_senders','max_connections')";
+              ('archive_mode','autovacuum','effective_cache_size', 'fsync', 'log_statement', 'maintenance_work_mem', 'max_wal_senders','max_connections')";
     my @result = `$psql_command -c "$sql" postgres`;
     my %pg_settings; 
     
@@ -295,19 +301,15 @@ sub health_cluster_config {
         print "$bad Maximum connections ($pg_settings{'max_connections'}) is too high. Consider reducing it or using a pooler\n";
     }
 
-    print "$bad Few wal_senders. Are you sure $pg_settings{'max_wal_senders'} is enough?\n" if $pg_settings{'max_wal_senders'} < 5;
+    print "$info Are you sure $pg_settings{'max_wal_senders'} wal_senders is enough?\n" if $pg_settings{'max_wal_senders'} < 5;
 
-    print "$info check_point_segments looks rather low. Checkpoints might be resource intensive\n" if $pg_settings{'checkpoint_segments'} < 10;
-
+    print "$info You are logging $pg_settings{'log_statement'} statements (variable=log_statement) \n" if $pg_settings{'log_statement'} ne 'none';
 
     #FIXME: maintenance_work_mem
     
     #FIXME: effective_cache_size
-    my $memtotal =  `cat /proc/meminfo | grep MemTotal`;
-    chomp($memtotal);
-    #print "memtotal: $memtotal\n";
-    #print "$pg_settings{'effective_cache_size'}\n";
-    
+
+
     # Check if EOL version 
     if (exists $postgres_eol{$POSTGRESQL_VERSION}) {
         my $today = localtime->strftime('%Y-%m-%d');
@@ -383,8 +385,30 @@ sub health_cluster_config {
     $low_nb == 0 ? print "$good Connected sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing" : 
                    print "$bad High number of sessions: $pct_connection% ($nb_connections / $max_connections)\n$connections_listing";
 
+    #--------------------------------------------------
+    # Check if pg_stat_statements is installed
+   
+    $sql = "select count(*) from pg_extension where extname= 'pg_stat_statements';";
+    my $pgstatsstatements = `$psql_command -c "$sql" postgres`;
+    $pgstatsstatements == 0 ? print "$info Consider using the pg_stat_statements extension to identify resource hungry queries\n" :
+                              print "$good Using the pg_stat_statements extension\n";
 
 }
+
+# #--------------------------------------------------------------------------------
+# check roles settings
+sub health_roles {
+    print "\n- Roles -------------------------------------\n";
+
+    #--------------------------------------------------
+    #List superusers
+    my $sql = "select usename from pg_user where usesuper;";
+    my @superuser = `$psql_command -c "$sql" postgres`;
+    chomp(@superuser);
+    print "$info List of superusers: @superuser \n";
+    
+}
+
 # #--------------------------------------------------------------------------------
 sub health_databases {
     print "\n- Databases -------------------------------------\n";
